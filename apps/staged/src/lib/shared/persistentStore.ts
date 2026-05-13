@@ -22,15 +22,20 @@ interface TauriStoreBackend {
 }
 
 // ---------------------------------------------------------------------------
-// localStorage backend (web mode) — stubbed out
-// TODO(web): restore localStorage backend from the `mobile-web` branch
+// localStorage backend (web mode)
 // ---------------------------------------------------------------------------
+
+const LOCAL_STORAGE_PREFIX = 'staged:pref:';
+
+interface LocalStorageBackend {
+  kind: 'localStorage';
+}
 
 // ---------------------------------------------------------------------------
 // Singleton
 // ---------------------------------------------------------------------------
 
-type StoreBackend = TauriStoreBackend | null;
+type StoreBackend = TauriStoreBackend | LocalStorageBackend | null;
 
 let backend: StoreBackend = null;
 
@@ -50,8 +55,9 @@ export async function initPersistentStore(): Promise<void> {
       overrideDefaults: true,
     });
     backend = { kind: 'tauri', store };
+  } else {
+    backend = { kind: 'localStorage' };
   }
-  // TODO(web): restore localStorage backend initialization for web mode
 }
 
 /**
@@ -64,7 +70,18 @@ export async function getStoreValue<T>(key: string): Promise<T | undefined> {
     return undefined;
   }
 
-  return backend.store.get<T>(key);
+  if (backend.kind === 'tauri') {
+    return backend.store.get<T>(key);
+  }
+
+  // localStorage backend
+  const raw = localStorage.getItem(LOCAL_STORAGE_PREFIX + key);
+  if (raw === null) return undefined;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -77,7 +94,13 @@ export async function setStoreValue<T>(key: string, value: T): Promise<void> {
     return;
   }
 
-  await backend.store.set(key, value);
+  if (backend.kind === 'tauri') {
+    await backend.store.set(key, value);
+    return;
+  }
+
+  // localStorage backend
+  localStorage.setItem(LOCAL_STORAGE_PREFIX + key, JSON.stringify(value));
 }
 
 /**
@@ -89,5 +112,11 @@ export async function deleteStoreValue(key: string): Promise<void> {
     return;
   }
 
-  await backend.store.delete(key);
+  if (backend.kind === 'tauri') {
+    await backend.store.delete(key);
+    return;
+  }
+
+  // localStorage backend
+  localStorage.removeItem(LOCAL_STORAGE_PREFIX + key);
 }

@@ -6,9 +6,6 @@
  * - Event listening (Tauri events vs WebSocket)
  * - Window management (Tauri window vs no-op)
  * - Clipboard (Tauri plugin vs navigator.clipboard)
- *
- * NOTE: Web-mode implementations are intentionally stubbed out in this build.
- * TODO(web): restore web transport paths from the `mobile-web` branch.
  */
 
 // ---------------------------------------------------------------------------
@@ -23,7 +20,7 @@ export const isTauri: boolean = typeof window !== 'undefined' && '__TAURI__' in 
 
 /**
  * Invoke a backend command. In Tauri mode this calls `invoke()` from the
- * Tauri API; in web mode it is stubbed out.
+ * Tauri API; in web mode it POSTs to `/api/invoke/{command}`.
  */
 export async function invokeCommand<T>(
   command: string,
@@ -34,8 +31,62 @@ export async function invokeCommand<T>(
     return invoke<T>(command, args);
   }
 
-  // TODO(web): restore HTTP transport from the `mobile-web` branch
-  throw new Error(`[transport] Web mode is not available in this build (command: ${command})`);
+  const response = await fetch(`/api/invoke/${command}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(args ?? {}),
+  });
+
+  if (response.status === 401) {
+    redirectToLogin();
+    throw new Error('Authentication required');
+  }
+
+  if (!response.ok) {
+    // The Axum server returns `{ "error": "..." }` JSON for BAD_REQUEST responses.
+    // Parse the JSON and extract the error field for a clean error message.
+    const text = await response.text();
+    try {
+      const body = JSON.parse(text);
+      if (body?.error) {
+        throw new Error(body.error);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message !== text) throw e;
+    }
+    throw new Error(text);
+  }
+
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
+// Web authentication
+// ---------------------------------------------------------------------------
+
+let loginRedirectPending = false;
+
+function redirectToLogin(): void {
+  if (loginRedirectPending) return;
+  loginRedirectPending = true;
+  // Use a small delay to batch multiple 401s that fire simultaneously
+  setTimeout(() => {
+    window.location.hash = '#/login';
+    loginRedirectPending = false;
+  }, 50);
+}
+
+/**
+ * Submit a bearer token to the web server's auth endpoint.
+ * On success the server sets a session cookie and subsequent requests are authenticated.
+ */
+export async function submitWebToken(token: string): Promise<boolean> {
+  const response = await fetch('/api/auth', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  return response.ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,24 +97,23 @@ export type UnlistenFn = () => void;
 
 /**
  * Listen to a backend event. In Tauri mode this delegates to the Tauri event
- * API; in web mode it is stubbed out.
+ * API; in web mode it connects to a shared WebSocket and filters by event name.
  *
  * Returns a synchronous unlisten function. Registration happens asynchronously
- * in the background; if the unlisten is called before registration finishes,
- * the eventual listener is torn down on arrival. This makes the helper safe to
- * use directly in `onMount` cleanup blocks without an intermediate
- * `Promise<UnlistenFn>` reference that could race the unmount.
+ * in the background for Tauri; if the unlisten is called before registration
+ * finishes, the eventual listener is torn down on arrival. This makes the
+ * helper safe to use directly in `onMount` cleanup blocks without an
+ * intermediate `Promise<UnlistenFn>` reference that could race the unmount.
  */
 export function listenToEvent<T>(event: string, callback: (payload: T) => void): UnlistenFn {
+  if (!isTauri) {
+    return webSocketListen<T>(event, callback);
+  }
+
   let cancelled = false;
   let unlisten: UnlistenFn | undefined;
 
   void (async () => {
-    if (!isTauri) {
-      // TODO(web): restore WebSocket event transport from the `mobile-web` branch
-      console.warn(`[transport] Web mode event listening stubbed out (event: ${event})`);
-      return;
-    }
     const { listen } = await import('@tauri-apps/api/event');
     const u = await listen<T>(event, (e) => callback(e.payload));
     if (cancelled) u();
@@ -75,6 +125,99 @@ export function listenToEvent<T>(event: string, callback: (payload: T) => void):
   return () => {
     cancelled = true;
     unlisten?.();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket singleton for web-mode events
+// ---------------------------------------------------------------------------
+
+interface WebSocketListener {
+  event: string;
+  callback: (payload: unknown) => void;
+}
+
+let ws: WebSocket | null = null;
+let wsListeners: WebSocketListener[] = [];
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let wsConnecting = false;
+
+function getWsUrl(): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/api/events`;
+}
+
+function ensureWebSocket(): void {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  if (wsConnecting) return;
+
+  wsConnecting = true;
+  ws = new WebSocket(getWsUrl());
+
+  ws.onopen = () => {
+    wsConnecting = false;
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+  };
+
+  ws.onmessage = (messageEvent) => {
+    try {
+      const data = JSON.parse(messageEvent.data) as { event: string; payload: unknown };
+      for (const listener of wsListeners) {
+        if (listener.event === data.event) {
+          listener.callback(data.payload);
+        }
+      }
+    } catch {
+      console.warn('[transport] Failed to parse WebSocket message:', messageEvent.data);
+    }
+  };
+
+  ws.onclose = () => {
+    wsConnecting = false;
+    // Auto-reconnect if there are still listeners
+    if (wsListeners.length > 0 && !wsReconnectTimer) {
+      wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        if (wsListeners.length > 0) {
+          ensureWebSocket();
+        }
+      }, 2000);
+    }
+  };
+
+  ws.onerror = () => {
+    wsConnecting = false;
+    // onclose will fire after onerror, which handles reconnect
+  };
+}
+
+function webSocketListen<T>(event: string, callback: (payload: T) => void): UnlistenFn {
+  const listener: WebSocketListener = {
+    event,
+    callback: callback as (payload: unknown) => void,
+  };
+
+  wsListeners.push(listener);
+  ensureWebSocket();
+
+  return () => {
+    wsListeners = wsListeners.filter((l) => l !== listener);
+    // Tear down WebSocket when no listeners remain
+    if (wsListeners.length === 0) {
+      if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+      }
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    }
   };
 }
 
@@ -92,6 +235,7 @@ interface WindowHandle {
 const noopWindow: WindowHandle = {
   show: async () => {},
   close: async () => {
+    // In browser mode, just close the tab/window
     window.close();
   },
   startDragging: async () => {},
@@ -100,7 +244,7 @@ const noopWindow: WindowHandle = {
 
 /**
  * Get a handle to the current window. In Tauri mode this returns the real
- * Tauri window; in web mode it returns a no-op implementation.
+ * Tauri window; in web mode it returns a no-op (or limited) implementation.
  */
 export async function getWindow(): Promise<WindowHandle> {
   if (isTauri) {
@@ -118,6 +262,7 @@ export async function getWindow(): Promise<WindowHandle> {
 export function getWindowSync(): WindowHandle {
   if (!isTauri) return noopWindow;
 
+  // Return a proxy that lazily imports the Tauri window API
   return {
     show: async () => {
       const { getCurrentWindow } = await import('@tauri-apps/api/window');
@@ -172,5 +317,6 @@ export async function onDragDropEvent(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     return getCurrentWebview().onDragDropEvent(callback as any);
   }
+  // No-op in web mode — native file drag is a Tauri-only feature
   return () => {};
 }
